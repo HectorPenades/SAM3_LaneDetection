@@ -578,11 +578,26 @@ def process_folder(args):
 	for img_path in image_paths:
 		processed_count += 1
 		stem = os.path.splitext(os.path.basename(img_path))[0]
-		gt_path = os.path.join(args.image_dir, stem + ".lines.txt")
+		# build GT path next to the image file (so .lines.txt is detected even if images come from image_list or other folders)
+		gt_path = os.path.splitext(img_path)[0] + ".lines.txt"
 
 		image = load_image(img_path)
 		image_np = np.array(image)  # RGB HxWx3
 		h, w = image_np.shape[:2]
+
+		# -----------------------------
+		# NUEVO: calcular ruta relativa de la imagen para el CSV (image_rel)
+		rel_path = None
+		try:
+			if getattr(args, 'image_root', None):
+				rel_path = os.path.relpath(img_path, args.image_root)
+			elif getattr(args, 'image_dir', None):
+				rel_path = os.path.relpath(img_path, args.image_dir)
+		except Exception:
+			rel_path = None
+		if rel_path is None:
+			rel_path = os.path.basename(img_path)
+		# -----------------------------
 
 		# Inferencia
 		inputs = processor(images=image, text=args.prompt, return_tensors="pt").to(device)
@@ -606,17 +621,20 @@ def process_folder(args):
 		else:
 			pred_mask_list = []
 
-		# Asegurar variables GT usadas más abajo (evita UnboundLocalError)
-		gt_present = False
-		gt_mask = None
-		if os.path.exists(gt_path):
+		# -----------------------------
+		# NUEVO: determinar existencia de fichero GT y si tiene líneas
+		gt_file_exists = os.path.exists(gt_path)
+		if gt_file_exists:
 			try:
 				gt_mask = culane_lines_to_mask(gt_path, w, h, thickness=args.gt_thickness)
-				gt_present = gt_mask.max() > 0
+				gt_has_lines = bool(gt_mask.max() > 0)
 			except Exception:
-				gt_mask = None
-				gt_present = False
-				
+				gt_mask = np.zeros((h, w), dtype=np.uint8)
+				gt_has_lines = False
+		else:
+			gt_mask = np.zeros((h, w), dtype=np.uint8)
+			gt_has_lines = False
+		# -----------------------------
 
 		# --- SAVE MASKS (opcional) ---
 		if getattr(args, 'save_mask', False) and len(pred_mask_list) > 0:
@@ -702,82 +720,115 @@ def process_folder(args):
 				print(f"   ⚠️ [create_txt_line] fallo para {stem}: {e}")
 
 		# --- RECOGER FEATURES por MÁSCARA (para CSV de entrenamiento) ---
-		if getattr(args, 'save_csv', False) and len(pred_mask_list) > 0:
-			for i_mask, pm in enumerate(pred_mask_list):
-				# básico
-				m_np = (pm > 0).astype(np.uint8)
-				# score (si existe)
-				try:
-					score_val = float(scores[i_mask].item()) if (scores is not None and len(scores) > i_mask) else None
-				except Exception:
-					score_val = None
-				# ML prob (si calculada)
-				ml_p = ml_probs.get(i_mask, None) if 'ml_probs' in locals() else None
-				# calcular features (robusto)
-				try:
-					feat = compute_mask_features(m_np, image_np)
-				except Exception as e:
-					feat = {}
-				# IoU vs GT (si existe)
-				if os.path.exists(gt_path):
-					iou_val = compute_iou_with_dilation(m_np * 255, gt_mask, dilation_radius=args.dilation_iou) if gt_present else None
-				else:
-					iou_val = None
-				# labels: label30 / label50 solo si hay GT; si no hay GT se omiten (vacío)
-				if iou_val is None:
-					label30 = ""
-					label50 = ""
-				else:
-					label30 = 1 if iou_val >= 0.3 else 0
-					label50 = 1 if iou_val >= 0.5 else 0
-
-				# RANSAC stats (solo si está activado)
-				ransac_stats = None
-				if getattr(args, 'debug_ransac', False):
+		if getattr(args, 'save_csv', False):
+			if len(pred_mask_list) > 0:
+				# ...existing per-mask code (sin cambios)
+				# Mantener exactamente el bloque anterior que itera por cada máscara y añade filas por máscara.
+				# (Se deja aquí como "existing per-mask code" para no duplicar; en su fichero real debe quedar el bloque original.)
+				for i_mask, pm in enumerate(pred_mask_list):
+					# básico
+					m_np = (pm > 0).astype(np.uint8)
+					# score (si existe)
 					try:
-						ransac_stats = compute_ransac_stats(m_np, image_np=image_np, ransac_tol=args.ransac_tol, min_samples=args.ransac_min_samples)
+						score_val = float(scores[i_mask].item()) if (scores is not None and len(scores) > i_mask) else None
 					except Exception:
-						ransac_stats = None
+						score_val = None
+					# ML prob (si calculada)
+					ml_p = ml_probs.get(i_mask, None) if 'ml_probs' in locals() else None
+					# calcular features (robusto)
+					try:
+						feat = compute_mask_features(m_np, image_np)
+					except Exception as e:
+						feat = {}
+					# IoU vs GT: si existe fichero .lines.txt calcular IoU (incluso si está vacío)
+					if gt_file_exists:
+						iou_val = compute_iou_with_dilation(m_np * 255, gt_mask, dilation_radius=args.dilation_iou)
+					else:
+						iou_val = None
+					# labels: label30 / label50 solo si hay fichero GT; si no hay fichero GT se omiten (vacío)
+					if iou_val is None:
+						label30 = ""
+						label50 = ""
+					else:
+						label30 = 1 if iou_val >= 0.3 else 0
+						label50 = 1 if iou_val >= 0.5 else 0
 
-				# Construir fila única y consistente
-				row = {
+					# RANSAC stats (solo si está activado)
+					ransac_stats = None
+					if getattr(args, 'debug_ransac', False):
+						try:
+							ransac_stats = compute_ransac_stats(m_np, image_np=image_np, ransac_tol=args.ransac_tol, min_samples=args.ransac_min_samples)
+						except Exception:
+							ransac_stats = None
+
+					# Construir fila única y consistente
+					row = {
+						"image_rel": rel_path,
+						"image": stem,
+						"mask_id": i_mask,
+						"gt_file_exists": int(gt_file_exists),
+						"gt_has_lines": int(gt_has_lines),
+						"gt_present": int(gt_has_lines),
+						"iou_to_gt": (None if iou_val is None else float(iou_val)),
+						"label30": label30,
+						"label50": label50,
+						"score": (None if score_val is None else float(score_val)),
+						"ml_prob": (None if ml_p is None else float(ml_p)),
+						"is_kept": int(i_mask in kept_indices) if 'kept_indices' in locals() else 0
+					}
+
+					# Adjuntar campos RANSAC si calculados
+					if ransac_stats:
+						row.update({
+							"ransac_applied": bool(ransac_stats.get('ransac_applied', False)),
+							"ransac_inliers": int(ransac_stats.get('inliers', 0)) if ransac_stats.get('ransac_applied', False) else 0,
+							"ransac_inline_pct": float(ransac_stats.get('inline_pct', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
+							"ransac_outline_pct": float(ransac_stats.get('outline_pct', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
+							"ransac_coef": float(ransac_stats.get('coef', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
+							"ransac_intercept": float(ransac_stats.get('intercept', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
+							"ransac_res_std": float(ransac_stats.get('res_std', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
+						})
+					else:
+						row.update({
+							"ransac_applied": False,
+							"ransac_inliers": 0,
+							"ransac_inline_pct": None,
+							"ransac_outline_pct": None,
+							"ransac_coef": None,
+							"ransac_intercept": None,
+							"ransac_res_std": None,
+						})
+
+					# añadir features al row (evitar claves conflictivas)
+					for k, v in feat.items():
+						row[f"feat_{k}"] = v
+					csv_rows.append(row)
+			else:
+				# No se detectaron máscaras: guardar fila "vacía" para que todas las imágenes aparezcan en el CSV
+				empty_row = {
+					"image_rel": rel_path,
 					"image": stem,
-					"mask_id": i_mask,
-					"gt_present": int(gt_present),
-					"iou_to_gt": (None if iou_val is None else float(iou_val)),
-					"label30": label30,
-					"label50": label50,
-					"score": (None if score_val is None else float(score_val)),
-					"ml_prob": (None if ml_p is None else float(ml_p)),
-					"is_kept": int(i_mask in kept_indices) if 'kept_indices' in locals() else 0
+					"mask_id": "",
+					"num_masks": 0,
+					"gt_file_exists": int(gt_file_exists),
+					"gt_has_lines": int(gt_has_lines),
+					"gt_present": int(gt_has_lines),
+					"iou_to_gt": "",
+					"label30": "",
+					"label50": "",
+					"score": None,
+					"ml_prob": None,
+					"is_kept": 0,
+					"ransac_applied": False,
+					"ransac_inliers": 0,
+					"ransac_inline_pct": None,
+					"ransac_outline_pct": None,
+					"ransac_coef": None,
+					"ransac_intercept": None,
+					"ransac_res_std": None,
 				}
+				csv_rows.append(empty_row)
 
-				# Adjuntar campos RANSAC si calculados
-				if ransac_stats:
-					row.update({
-						"ransac_applied": bool(ransac_stats.get('ransac_applied', False)),
-						"ransac_inliers": int(ransac_stats.get('inliers', 0)) if ransac_stats.get('ransac_applied', False) else 0,
-						"ransac_inline_pct": float(ransac_stats.get('inline_pct', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
-						"ransac_outline_pct": float(ransac_stats.get('outline_pct', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
-						"ransac_coef": float(ransac_stats.get('coef', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
-						"ransac_intercept": float(ransac_stats.get('intercept', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
-						"ransac_res_std": float(ransac_stats.get('res_std', 0.0)) if ransac_stats.get('ransac_applied', False) else None,
-					})
-				else:
-					row.update({
-						"ransac_applied": False,
-						"ransac_inliers": 0,
-						"ransac_inline_pct": None,
-						"ransac_outline_pct": None,
-						"ransac_coef": None,
-						"ransac_intercept": None,
-						"ransac_res_std": None,
-					})
-
-				# añadir features al row (evitar claves conflictivas)
-				for k, v in feat.items():
-					row[f"feat_{k}"] = v
-				csv_rows.append(row)
 		# Aplicar filtrado por instancia (reglas) para obtener candidatos
 		candidate_indices = set(range(len(pred_mask_list))) if masks is not None else set()
 		if args.filter_instances and masks is not None and len(masks) > 0:
@@ -835,11 +886,8 @@ def process_folder(args):
 		# Inicializar estructura de resultados por imagen (evita NameError al añadir ml_prob)
 		row_result = {}
 
-		gt_present = False
-		gt_mask = None
-		if os.path.exists(gt_path):
-			gt_mask = culane_lines_to_mask(gt_path, w, h, thickness=args.gt_thickness)
-			gt_present = gt_mask.max() > 0
+		# REUSAR gt_file_exists / gt_has_lines / gt_mask ya calculados más arriba
+		gt_present = gt_has_lines  # para compatibilidad con el resto del código
 
 		overlay = image_np.copy()
 		counts = {"green":0, "yellow":0, "red":0, "no_pred":0}
@@ -860,7 +908,7 @@ def process_folder(args):
 						if ransac_stats.get('ransac_applied'):
 							print(f"      [RANSAC] mask_{i}: area={ransac_stats['area']} pts={ransac_stats['num_points']} inliers={ransac_stats['inliers']} inline%={ransac_stats['inline_pct']*100:.2f} outline%={ransac_stats['outline_pct']*100:.2f} coef={ransac_stats['coef']:.3f} int={ransac_stats['intercept']:.2f} res_std={ransac_stats['res_std']:.3f} swap={ransac_stats['swap']}")
 							# Dibujar inline% directamente en la overlay (solo en modo debug_ransac)
-							try:
+							'''try:
 								inline_pct = ransac_stats.get('inline_pct', 0.0)
 								ys_i, xs_i = np.where(pm > 0)
 								if len(xs_i) > 0:
@@ -873,6 +921,7 @@ def process_folder(args):
 							except Exception:
 								# no bloquear el bucle por un fallo de dibujo
 								pass
+							'''
 						else:
 							if 'error' in ransac_stats:
 								print(f"      [RANSAC] mask_{i}: no aplicado (error={ransac_stats['error']})")
@@ -939,16 +988,19 @@ def process_folder(args):
 			ml_prob_flat = ";".join([f"{k}={v:.3f}" for k,v in row_result['ml_prob'].items()])
 		summary_rows.append({
 			"image": stem,
+			"image_rel": rel_path,
 			"num_preds": len(pred_mask_list),
 			"num_green": counts["green"],
 			"num_yellow": counts["yellow"],
 			"num_red": counts["red"],
 			"gt_present": int(gt_present),
+			"gt_file_exists": int(gt_file_exists),
+			"gt_has_lines": int(gt_has_lines),
 			"saved_overlay": out_path,
 			"ml_probs": ml_prob_flat
 		})
 
-		print(f"{stem}: preds={len(pred_mask_list)}, green={counts['green']}, yellow={counts['yellow']}, red={counts['red']}, gt={gt_present}")
+		print(f"{stem}: preds={len(pred_mask_list)}, green={counts['green']}, yellow={counts['yellow']}, red={counts['red']}, gt_file_exists={gt_file_exists}, gt_has_lines={gt_has_lines}")
 
 		# Guardado periódico si se solicitó (--save_csv_interval > 0)
 		if getattr(args, 'save_csv', False) and getattr(args, 'save_csv_interval', 0) > 0 and save_ts_base is not None:
@@ -1004,7 +1056,7 @@ def parse_args():
      parser.add_argument("--line_subsample_k", type=int, default=10, help="Submuestrear skeleton points: tomar 1 cada K puntos (K>=1). Default=1 (mantener todos).")
      parser.add_argument("--line_resample_n", type=int, default=0, help="Si >0, re-muestrear cada línea a N puntos uniformes (sobrescribe subsample_k). Default=0 (desactivado).")
      parser.add_argument("--line_draw_thickness", type=int, default=2, help="Grosor (px) para dibujar la línea guardada (.lines.txt) en el overlay (color lila).")
-     parser.add_argument("--save_csv_interval", type=int, default=1, help="Si >0, guarda los CSV cada N imágenes procesadas (0 = solo al final). --save_csv debe activarse.")
+     parser.add_argument("--save_csv_interval", type=int, default=20, help="Si >0, guarda los CSV cada N imágenes procesadas (0 = solo al final). --save_csv debe activarse.")
      return parser.parse_args()
 
 if __name__ == "__main__":
