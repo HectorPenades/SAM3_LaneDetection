@@ -301,6 +301,39 @@ def compute_mask_features(mask_np, image_np=None):
     return features
 # --------------------------------------------------------
 
+# NUEVA: contar líneas válidas en un fichero .lines.txt
+def count_gt_lines(lines_txt_path):
+    """
+    Devuelve el número de líneas válidas en un fichero .lines.txt.
+    Una línea válida tiene al menos 4 números (2 puntos) y al menos un par (x,y) con x>=0 y y>=0.
+    Si el fichero no existe devuelve 0.
+    """
+    if not os.path.exists(lines_txt_path):
+        return 0
+    cnt = 0
+    try:
+        with open(lines_txt_path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 4:
+                    continue
+                try:
+                    coords = list(map(float, parts))
+                except Exception:
+                    continue
+                has_valid = False
+                for i in range(0, len(coords), 2):
+                    if i + 1 < len(coords):
+                        x, y = coords[i], coords[i+1]
+                        if x >= 0 and y >= 0:
+                            has_valid = True
+                            break
+                if has_valid:
+                    cnt += 1
+    except Exception:
+        return 0
+    return cnt
+
 def blend_color_on_mask(base, mask_idx, color_rgb, alpha=0.6):
     """Pinta color RGB sobre base (HxWx3 uint8) donde mask_idx es True."""
     if not mask_idx.any():
@@ -424,8 +457,8 @@ def masks_to_culane_lines(pred_mask_list, subsample_k=1, resample_n=0):
 def process_folder(args):
 	# ...existing code...
 
-	# Helper para salvar CSVs (resumen + features)
-	def save_csvs(summary_rows_local, csv_rows_local, out_dir, ts_base):
+	# Helper para salvar CSVs (resumen + features + metrics)
+	def save_csvs(summary_rows_local, csv_rows_local, metrics_rows_local, out_dir, ts_base):
 		os.makedirs(out_dir, exist_ok=True)
 		summary_path = os.path.join(out_dir, f"infer_summary_{ts_base}.csv")
 		pd.DataFrame(summary_rows_local).to_csv(summary_path, index=False)
@@ -436,6 +469,12 @@ def process_folder(args):
 			print(f"[SAVE_CSV] Features por máscara guardado en: {os.path.abspath(masks_path)}")
 		else:
 			print(f"[SAVE_CSV] No hay filas para mask_features (no se guardó).")
+		if metrics_rows_local is not None and len(metrics_rows_local) > 0:
+			metrics_path = os.path.join(out_dir, f"metrics_log_{ts_base}.csv")
+			pd.DataFrame(metrics_rows_local).to_csv(metrics_path, index=False)
+			print(f"[SAVE_CSV] Metrics log guardado en: {os.path.abspath(metrics_path)}")
+		else:
+			print(f"[SAVE_CSV] No hay métricas para guardar (metrics_log).")
 
 	# Si se pidió save_csv, precomputar timestamp base (usado para saves periódicos)
 	save_ts_base = None
@@ -575,6 +614,14 @@ def process_folder(args):
 	# Acumulador para CSV de features por máscara (usado para entrenamiento)
 	csv_rows = []
 	processed_count = 0
+	# Inicializar acumuladores para métricas (IoU30 e IoU50)
+	metrics_rows = []
+	total_TP30 = 0
+	total_FP30 = 0
+	total_GT_lanes_30 = 0  # suma de GT lanes (solo donde gt_has_lines == True)
+	total_TP50 = 0
+	total_FP50 = 0
+	total_GT_lanes_50 = 0
 	for img_path in image_paths:
 		processed_count += 1
 		stem = os.path.splitext(os.path.basename(img_path))[0]
@@ -635,6 +682,11 @@ def process_folder(args):
 			gt_mask = np.zeros((h, w), dtype=np.uint8)
 			gt_has_lines = False
 		# -----------------------------
+
+		# NUEVO: contar GT lanes para esta imagen (solo si existe fichero)
+		gt_lane_count = 0
+		if gt_file_exists:
+			gt_lane_count = count_gt_lines(gt_path)  # 0 si el fichero existe pero está vacío o no válido
 
 		# --- SAVE MASKS (opcional) ---
 		if getattr(args, 'save_mask', False) and len(pred_mask_list) > 0:
@@ -722,9 +774,12 @@ def process_folder(args):
 		# --- RECOGER FEATURES por MÁSCARA (para CSV de entrenamiento) ---
 		if getattr(args, 'save_csv', False):
 			if len(pred_mask_list) > 0:
-				# ...existing per-mask code (sin cambios)
-				# Mantener exactamente el bloque anterior que itera por cada máscara y añade filas por máscara.
-				# (Se deja aquí como "existing per-mask code" para no duplicar; en su fichero real debe quedar el bloque original.)
+				# contadores por imagen para métricas
+				img_TP30 = 0
+				img_FP30 = 0
+				img_TP50 = 0
+				img_FP50 = 0
+
 				for i_mask, pm in enumerate(pred_mask_list):
 					# básico
 					m_np = (pm > 0).astype(np.uint8)
@@ -742,16 +797,33 @@ def process_folder(args):
 						feat = {}
 					# IoU vs GT: si existe fichero .lines.txt calcular IoU (incluso si está vacío)
 					if gt_file_exists:
-						iou_val = compute_iou_with_dilation(m_np * 255, gt_mask, dilation_radius=args.dilation_iou)
+						# usar máscara de pred (habitual) para IoU salvo que se solicite ransac
+						if getattr(args, 'iou_use_ransac', False):
+							pred_for_iou = ransac_mask_from_mask(m_np, h, w, ransac_tol=args.ransac_tol, min_samples=args.ransac_min_samples)
+						else:
+							pred_for_iou = (m_np * 255).astype(np.uint8)
+						iou_val = compute_iou_with_dilation(pred_for_iou, gt_mask, dilation_radius=args.dilation_iou)
 					else:
 						iou_val = None
-					# labels: label30 / label50 solo si hay fichero GT; si no hay fichero GT se omiten (vacío)
 					if iou_val is None:
 						label30 = ""
 						label50 = ""
 					else:
 						label30 = 1 if iou_val >= 0.3 else 0
 						label50 = 1 if iou_val >= 0.5 else 0
+
+					# actualizar contadores por imagen (solo si existe fichero GT con líneas)
+					if gt_file_exists and gt_has_lines:
+						if label30 != "":
+							if int(label30) == 1:
+								img_TP30 += 1
+							else:
+								img_FP30 += 1
+						if label50 != "":
+							if int(label50) == 1:
+								img_TP50 += 1
+							else:
+								img_FP50 += 1
 
 					# RANSAC stats (solo si está activado)
 					ransac_stats = None
@@ -803,6 +875,16 @@ def process_folder(args):
 					for k, v in feat.items():
 						row[f"feat_{k}"] = v
 					csv_rows.append(row)
+				# --- ACTUALIZAR ACUMULADOS GLOBALES tras procesar todas las máscaras de la imagen ---
+				# sumar TP/FP detectadas en esta imagen
+				total_TP30 += img_TP30
+				total_FP30 += img_FP30
+				total_TP50 += img_TP50
+				total_FP50 += img_FP50
+				# si existe fichero GT con líneas, sumar el número de GT lanes (estas contadas como posibles FN si no se detectan)
+				if gt_file_exists and gt_has_lines:
+					total_GT_lanes_30 += gt_lane_count
+					total_GT_lanes_50 += gt_lane_count
 			else:
 				# No se detectaron máscaras: guardar fila "vacía" para que todas las imágenes aparezcan en el CSV
 				empty_row = {
@@ -828,6 +910,10 @@ def process_folder(args):
 					"ransac_res_std": None,
 				}
 				csv_rows.append(empty_row)
+				# Si no hubo predicciones pero sí GT, las GT lanes son contabilizadas (TP=0, FN aumentarán en snapshot)
+				if gt_file_exists and gt_has_lines:
+					total_GT_lanes_30 += gt_lane_count
+					total_GT_lanes_50 += gt_lane_count
 
 		# Aplicar filtrado por instancia (reglas) para obtener candidatos
 		candidate_indices = set(range(len(pred_mask_list))) if masks is not None else set()
@@ -1007,7 +1093,33 @@ def process_folder(args):
 			interval = int(getattr(args, 'save_csv_interval', 0))
 			if interval > 0 and (processed_count % interval == 0):
 				print(f"[SAVE_CSV] Guardando CSVs parciales tras procesar {processed_count} imágenes...")
-				save_csvs(summary_rows, csv_rows, args.out_dir, save_ts_base)
+				# Crear snapshot de métricas acumuladas hasta ahora y añadir timestamp
+				curr_FN30 = max(0, total_GT_lanes_30 - total_TP30)
+				curr_FN50 = max(0, total_GT_lanes_50 - total_TP50)
+				prec30 = (total_TP30 / (total_TP30 + total_FP30)) if (total_TP30 + total_FP30) > 0 else 0.0
+				rec30 = (total_TP30 / (total_TP30 + curr_FN30)) if (total_TP30 + curr_FN30) > 0 else 0.0
+				f1_30 = (2 * prec30 * rec30 / (prec30 + rec30)) if (prec30 + rec30) > 0 else 0.0
+				prec50 = (total_TP50 / (total_TP50 + total_FP50)) if (total_TP50 + total_FP50) > 0 else 0.0
+				rec50 = (total_TP50 / (total_TP50 + curr_FN50)) if (total_TP50 + curr_FN50) > 0 else 0.0
+				f1_50 = (2 * prec50 * rec50 / (prec50 + rec50)) if (prec50 + rec50) > 0 else 0.0
+				metrics_rows.append({
+					"ts": datetime.now().strftime("%Y%m%d_%H%M%S"),
+					"processed_images": processed_count,
+					"TP30": int(total_TP30),
+					"FP30": int(total_FP30),
+					"FN30": int(curr_FN30),
+					"precision30": float(prec30),
+					"recall30": float(rec30),
+					"f1_30": float(f1_30),
+					"GT_lanes_total": int(total_GT_lanes_30),
+					"TP50": int(total_TP50),
+					"FP50": int(total_FP50),
+					"FN50": int(curr_FN50),
+					"precision50": float(prec50),
+					"recall50": float(rec50),
+					"f1_50": float(f1_50)
+				})
+				save_csvs(summary_rows, csv_rows, metrics_rows, args.out_dir, save_ts_base)
 
 	# Guardar CSV resumen final (si se pidió)
 	if getattr(args, 'save_csv', False):
@@ -1015,7 +1127,38 @@ def process_folder(args):
 		if save_ts_base is None:
 			save_ts_base = datetime.now().strftime("%Y%m%d_%H%M%S")
 		print(f"[SAVE_CSV] Guardando CSVs finales...")
-		save_csvs(summary_rows, csv_rows, args.out_dir, save_ts_base)
+		# calcular métricas finales
+		final_FN30 = max(0, total_GT_lanes_30 - total_TP30)
+		final_FN50 = max(0, total_GT_lanes_50 - total_TP50)
+		final_prec30 = (total_TP30 / (total_TP30 + total_FP30)) if (total_TP30 + total_FP30) > 0 else 0.0
+		final_rec30 = (total_TP30 / (total_TP30 + final_FN30)) if (total_TP30 + final_FN30) > 0 else 0.0
+		final_f1_30 = (2 * final_prec30 * final_rec30 / (final_prec30 + final_rec30)) if (final_prec30 + final_rec30) > 0 else 0.0
+		final_prec50 = (total_TP50 / (total_TP50 + total_FP50)) if (total_TP50 + total_FP50) > 0 else 0.0
+		final_rec50 = (total_TP50 / (total_TP50 + final_FN50)) if (total_TP50 + final_FN50) > 0 else 0.0
+		final_f1_50 = (2 * final_prec50 * final_rec50 / (final_prec50 + final_rec50)) if (final_prec50 + final_rec50) > 0 else 0.0
+
+		metrics_rows.append({
+			"ts": datetime.now().strftime("%Y%m%d_%H%M%S"),
+			"processed_images": processed_count,
+			"TP30": int(total_TP30),
+			"FP30": int(total_FP30),
+			"FN30": int(final_FN30),
+			"precision30": float(final_prec30),
+			"recall30": float(final_rec30),
+			"f1_30": float(final_f1_30),
+			"GT_lanes_total": int(total_GT_lanes_30),
+			"TP50": int(total_TP50),
+			"FP50": int(total_FP50),
+			"FN50": int(final_FN50),
+			"precision50": float(final_prec50),
+			"recall50": float(final_rec50),
+			"f1_50": float(final_f1_50)
+		})
+
+		print(f"[SAVE_METRICS] Final metrics: P30={final_prec30:.3f} R30={final_rec30:.3f} F1_30={final_f1_30:.3f}")
+
+		print(f"[SAVE_CSV] Guardando CSVs finales...")
+		save_csvs(summary_rows, csv_rows, metrics_rows, args.out_dir, save_ts_base)
 
 def parse_args():
      parser = argparse.ArgumentParser(description="Infer + visualize SAM3 masks vs GT (autónomo)")
